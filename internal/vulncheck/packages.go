@@ -6,6 +6,7 @@ package vulncheck
 
 import (
 	"fmt"
+	"go/ast"
 	"os/exec"
 	"slices"
 	"strings"
@@ -22,9 +23,10 @@ import (
 type PackageGraph struct {
 	// topPkgs are top-level packages specified by the user.
 	// Empty in binary mode.
-	topPkgs  []*packages.Package
-	modules  map[string]*packages.Module  // all modules (even replacing ones)
-	packages map[string]*packages.Package // all packages (even dependencies)
+	topPkgs     []*packages.Package
+	modules     map[string]*packages.Module  // all modules (even replacing ones)
+	packages    map[string]*packages.Package // all packages (even dependencies)
+	loadSymbols func() error
 }
 
 func NewPackageGraph(goVersion string) *PackageGraph {
@@ -192,6 +194,66 @@ func (g *PackageGraph) GetPackage(path string) *packages.Package {
 	}
 	g.AddPackages(pkg)
 	return pkg
+}
+
+// releaseAnalysisData drops package-loading data that is no longer needed
+// after SSA construction. Init call stack reporting only needs package and
+// import positions, so retain a compact AST containing those nodes.
+func (g *PackageGraph) releaseAnalysisData() {
+	for _, pkg := range g.packages {
+		files := make([]*ast.File, len(pkg.Syntax))
+		for i, file := range pkg.Syntax {
+			files[i] = &ast.File{
+				Package: file.Package,
+				Imports: file.Imports,
+			}
+		}
+		pkg.Syntax = files
+		pkg.TypesInfo = nil
+	}
+}
+
+// LoadPackagesAndModsDeferred loads the package and module graph without the
+// typed syntax needed for symbol analysis. It defers that expensive work until
+// loadAnalysisData is called.
+func (g *PackageGraph) LoadPackagesAndModsDeferred(cfg *packages.Config, tags []string, patterns []string) error {
+	// Preserve the validation performed by symbol scans without retaining the
+	// syntax and TypesInfo required only by call graph construction.
+	cfg.Mode |= packages.NeedTypes
+	if err := g.LoadPackagesAndMods(cfg, tags, patterns, false); err != nil {
+		return err
+	}
+
+	analysisCfg := *cfg
+	analysisCfg.BuildFlags = slices.Clone(cfg.BuildFlags)
+	analysisCfg.Env = slices.Clone(cfg.Env)
+	tags = slices.Clone(tags)
+	patterns = slices.Clone(patterns)
+	stdlib := g.GetModule(internal.GoStdModulePath)
+
+	g.loadSymbols = func() error {
+		analysis := &PackageGraph{
+			modules:  map[string]*packages.Module{},
+			packages: map[string]*packages.Package{},
+		}
+		analysis.AddModules(stdlib)
+		if err := analysis.LoadPackagesAndMods(&analysisCfg, tags, patterns, true); err != nil {
+			return err
+		}
+		if len(analysis.TopPkgs()) == 0 {
+			return fmt.Errorf("no packages matched")
+		}
+		*g = *analysis
+		return nil
+	}
+	return nil
+}
+
+func (g *PackageGraph) loadAnalysisData() error {
+	if g.loadSymbols == nil {
+		return nil
+	}
+	return g.loadSymbols()
 }
 
 // LoadPackages loads the packages specified by the patterns into the graph.

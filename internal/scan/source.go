@@ -31,11 +31,17 @@ func runSource(ctx context.Context, handler govulncheck.Handler, cfg *config, cl
 	}
 	graph := vulncheck.NewPackageGraph(cfg.GoVersion)
 	pkgConfig := &packages.Config{
-		Dir:   dir,
-		Tests: cfg.test,
-		Env:   cfg.env,
+		Context: ctx,
+		Dir:     dir,
+		Tests:   cfg.test,
+		Env:     cfg.env,
 	}
-	if err := graph.LoadPackagesAndMods(pkgConfig, cfg.tags, cfg.patterns, cfg.ScanLevel == govulncheck.ScanLevelSymbol); err != nil {
+	if cfg.ScanLevel == govulncheck.ScanLevelSymbol {
+		err = graph.LoadPackagesAndModsDeferred(pkgConfig, cfg.tags, cfg.patterns)
+	} else {
+		err = graph.LoadPackagesAndMods(pkgConfig, cfg.tags, cfg.patterns, false)
+	}
+	if err != nil {
 		if isGoVersionMismatchError(err) {
 			return fmt.Errorf("%v\n\n%v", errGoVersionMismatch, err)
 		}

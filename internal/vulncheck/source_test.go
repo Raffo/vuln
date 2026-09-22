@@ -191,7 +191,7 @@ func TestCalls(t *testing.T) {
 
 	// Load x and y as entry packages.
 	graph := NewPackageGraph("go1.18")
-	err := graph.LoadPackagesAndMods(e.Config, nil, []string{path.Join(e.Temp(), "entry/x"), path.Join(e.Temp(), "entry/y")}, true)
+	err := graph.LoadPackagesAndModsDeferred(e.Config, nil, []string{path.Join(e.Temp(), "entry/x"), path.Join(e.Temp(), "entry/y")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +241,68 @@ func TestCalls(t *testing.T) {
 
 	if callStrMap := callGraphToStrMap(result); !reflect.DeepEqual(wantCalls, callStrMap) {
 		t.Errorf("want %v call graph; got %v", wantCalls, callStrMap)
+	}
+
+	for _, pkg := range graph.packages {
+		if pkg.TypesInfo != nil {
+			t.Errorf("%s: TypesInfo was not released", pkg.PkgPath)
+		}
+		for _, file := range pkg.Syntax {
+			if len(file.Decls) != 0 {
+				t.Errorf("%s: syntax declarations were not released", pkg.PkgPath)
+			}
+		}
+	}
+	entryPkg := graph.GetPackage("golang.org/entry/x")
+	if len(entryPkg.Syntax) == 0 || len(entryPkg.Syntax[0].Imports) == 0 {
+		t.Error("import position syntax was not retained")
+	}
+}
+
+func TestSourceSkipsAnalysisWithoutVulnerabilities(t *testing.T) {
+	e := packagestest.Export(t, packagestest.Modules, []packagestest.Module{{
+		Name: "golang.org/entry",
+		Files: map[string]interface{}{
+			"x/x.go": "package x\n\nfunc X() {}",
+		},
+	}})
+	defer e.Cleanup()
+
+	graph := NewPackageGraph("go1.18")
+	if err := graph.LoadPackagesAndModsDeferred(e.Config, nil, []string{path.Join(e.Temp(), "entry/x")}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := client.NewInMemoryClient(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &govulncheck.Config{ScanLevel: "symbol"}
+	if _, err := source(context.Background(), test.NewMockHandler(), cfg, c, graph); err != nil {
+		t.Fatal(err)
+	}
+	if graph.loadSymbols == nil {
+		t.Fatal("symbol loading was not deferred")
+	}
+	for _, pkg := range graph.packages {
+		if pkg.TypesInfo != nil || len(pkg.Syntax) != 0 {
+			t.Errorf("%s: analysis data was loaded without vulnerabilities", pkg.PkgPath)
+		}
+	}
+}
+
+func TestDeferredAnalysisValidatesPackages(t *testing.T) {
+	e := packagestest.Export(t, packagestest.Modules, []packagestest.Module{{
+		Name: "golang.org/entry",
+		Files: map[string]interface{}{
+			"x/x.go": "package x\n\nvar _ = undefined",
+		},
+	}})
+	defer e.Cleanup()
+
+	graph := NewPackageGraph("go1.18")
+	if err := graph.LoadPackagesAndModsDeferred(e.Config, nil, []string{path.Join(e.Temp(), "entry/x")}); err == nil {
+		t.Fatal("LoadPackagesAndModsDeferred succeeded for an invalid package")
 	}
 }
 

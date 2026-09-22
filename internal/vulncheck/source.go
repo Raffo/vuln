@@ -6,7 +6,7 @@ package vulncheck
 
 import (
 	"context"
-	"sync"
+	"fmt"
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/packages"
@@ -34,29 +34,6 @@ func Source(ctx context.Context, handler govulncheck.Handler, cfg *govulncheck.C
 //
 // Assumes that pkgs are non-empty and belong to the same program.
 func source(ctx context.Context, handler govulncheck.Handler, cfg *govulncheck.Config, client *client.Client, graph *PackageGraph) (*Result, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// If we are building the callgraph, build ssa and the callgraph in parallel
-	// with fetching vulnerabilities. If the vulns set is empty, return without
-	// waiting for SSA construction or callgraph to finish.
-	var (
-		wg       sync.WaitGroup // guards entries, cg, and buildErr
-		entries  []*ssa.Function
-		cg       *callgraph.Graph
-		buildErr error
-	)
-	if cfg.ScanLevel.WantSymbols() {
-		fset := graph.TopPkgs()[0].Fset
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			prog, ssaPkgs := buildSSA(graph.TopPkgs(), fset)
-			entries = entryPoints(ssaPkgs)
-			cg, buildErr = callGraph(ctx, prog, entries)
-		}()
-	}
-
 	if err := handler.SBOM(graph.SBOM()); err != nil {
 		return nil, err
 	}
@@ -101,8 +78,27 @@ func source(ctx context.Context, handler govulncheck.Handler, cfg *govulncheck.C
 		return &Result{Vulns: impVulns}, nil
 	}
 
-	wg.Wait() // wait for build to finish
-	if buildErr != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := graph.loadAnalysisData(); err != nil {
+		return nil, fmt.Errorf("loading packages for symbol analysis: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	fset := graph.TopPkgs()[0].Fset
+	prog, ssaPkgs := buildSSA(graph.TopPkgs(), fset)
+	entries := entryPoints(ssaPkgs)
+
+	// SSA retains the program data needed by call graph construction. Release
+	// loader-only data before allocating the graph, while retaining the small
+	// subset of AST positions needed to report init call stacks.
+	graph.releaseAnalysisData()
+
+	cg, err := callGraph(ctx, prog, entries)
+	if err != nil {
 		return nil, err
 	}
 

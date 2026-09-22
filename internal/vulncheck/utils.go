@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/callgraph"
-	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/callgraph/vta"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
@@ -22,6 +21,7 @@ import (
 	"golang.org/x/vuln/internal/semver"
 
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // buildSSA creates an ssa representation for pkgs. Returns
@@ -69,21 +69,24 @@ func callGraph(ctx context.Context, prog *ssa.Program, entries []*ssa.Function) 
 	if err := ctx.Err(); err != nil { // cancelled?
 		return nil, err
 	}
-	initial := cha.CallGraph(prog)
-
+	// Let VTA use its lazy CHA resolver instead of materializing the complete
+	// CHA graph, whose highly polymorphic edges dominate memory on large
+	// programs. The entry-scoped passes below restore precision after the
+	// global first pass.
+	initial := vta.CallGraph(ssautil.AllFunctions(prog), nil)
 	fslice := forwardSlice(entrySlice, initial)
 	if err := ctx.Err(); err != nil { // cancelled?
 		return nil, err
 	}
-	vtaCg := vta.CallGraph(fslice, initial)
+	refined := vta.CallGraph(fslice, initial)
 
-	// Repeat the process once more, this time using
-	// the produced VTA call graph as the base graph.
-	fslice = forwardSlice(entrySlice, vtaCg)
+	// Repeat the entry-point slice and VTA refinement to remove type flows
+	// introduced by functions that were present only in the global first pass.
+	fslice = forwardSlice(entrySlice, refined)
 	if err := ctx.Err(); err != nil { // cancelled?
 		return nil, err
 	}
-	cg := vta.CallGraph(fslice, vtaCg)
+	cg := vta.CallGraph(fslice, refined)
 	cg.DeleteSyntheticNodes()
 	return cg, nil
 }

@@ -5,6 +5,7 @@
 package vulncheck
 
 import (
+	"context"
 	"path"
 	"reflect"
 	"testing"
@@ -115,5 +116,43 @@ func Do(i I, input string) {
 	}
 	if !reflect.DeepEqual(want, fs) {
 		t.Errorf("want %v; got %v", want, fs)
+	}
+}
+
+func TestCallGraphRemovesGlobalTypeFlow(t *testing.T) {
+	const src = `package p
+
+var g, h func()
+
+func Entry() {
+	g()
+	h()
+}
+
+func unrelated() { g = f1 }
+func f1()        { h = f2 }
+func f2()        {}
+`
+	e := packagestest.Export(t, packagestest.Modules, []packagestest.Module{{
+		Name:  "some/module",
+		Files: map[string]interface{}{"p/p.go": src},
+	}})
+	defer e.Cleanup()
+
+	graph := NewPackageGraph("go1.18")
+	if err := graph.LoadPackagesAndMods(e.Config, nil, []string{path.Join(e.Temp(), "module/p")}, true); err != nil {
+		t.Fatal(err)
+	}
+	prog, ssaPkgs := buildSSA(graph.TopPkgs(), graph.TopPkgs()[0].Fset)
+	entry := ssaPkgs[0].Func("Entry")
+	cg, err := callGraph(context.Background(), prog, []*ssa.Function{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := funcNames(forwardSlice(map[*ssa.Function]bool{entry: true}, cg))
+	want := map[string]bool{"Entry": true}
+	if !reflect.DeepEqual(want, got) {
+		t.Errorf("entry-reachable functions: want %v; got %v", want, got)
 	}
 }
